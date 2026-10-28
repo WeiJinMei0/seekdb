@@ -29,6 +29,7 @@
 #include "storage/fts/ob_ngram_ft_parser.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
 #include "storage/fts/ob_fts_stop_word.h"
+#include "storage/fts/reusable_ft_parser.h"
 #include "storage/fts/ob_whitespace_ft_parser.h"
 
 namespace oceanbase
@@ -263,7 +264,7 @@ int ObFTParseHelper::segment(
     const char *ft,
     const int64_t ft_len,
     common::ObIAllocator &allocator,
-    ObAddWord &add_word)
+    ObAddWord &add_word) const
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(parser_version < 0 || nullptr == parser_desc || nullptr == cs || nullptr == ft || 0 >= ft_len)) {
@@ -272,6 +273,7 @@ int ObFTParseHelper::segment(
     ObFTParserParam param;
     ObITokenIterator *iter = nullptr;
     param.allocator_ = &allocator;
+    param.metadata_allocator_ = &parser_allocator_;
     param.cs_ = cs;
     param.fulltext_ = ft;
     param.ft_length_ = ft_len;
@@ -282,10 +284,18 @@ int ObFTParseHelper::segment(
     param.min_ngram_size_ = property.min_ngram_token_size_;
     param.max_ngram_size_ = property.max_ngram_token_size_;
 
-    if (OB_FAIL(parser_desc->segment(&param, iter))) {
+    const bool parser_is_reusable = parser_name_.is_ik() || parser_name_.is_beng();
+    if (parser_is_reusable && OB_NOT_NULL(reusable_parser_)) {
+      iter = reusable_parser_;
+      if (OB_FAIL(reusable_parser_->reuse_parser(param))) {
+      }
+    } else if (OB_FAIL(parser_desc->segment(&param, iter))) {
     } else if (OB_ISNULL(iter)) {
       ret = OB_ERR_UNEXPECTED;
-    } else {
+    } else if (parser_is_reusable) {
+      reusable_parser_ = static_cast<ReusableFTParser *>(iter);
+    }
+    if (OB_SUCC(ret)) {
       const char *word = nullptr;
       int64_t word_len = 0;
       int64_t char_cnt = 0;
@@ -301,7 +311,7 @@ int ObFTParseHelper::segment(
         ret = OB_SUCCESS;
       }
     }
-    if (OB_NOT_NULL(iter)) {
+    if (OB_NOT_NULL(iter) && !parser_is_reusable) {
       parser_desc->free_token_iter(&param, iter);
       iter = nullptr;
     }
@@ -315,6 +325,8 @@ ObFTParseHelper::ObFTParseHelper()
     parser_name_(),
     add_word_flag_(),
     parser_property_(),
+    parser_allocator_(lib::ObMemAttr("FTParserState")),
+    reusable_parser_(nullptr),
     is_inited_(false)
 {
 }
@@ -352,6 +364,15 @@ int ObFTParseHelper::init(
 
 void ObFTParseHelper::reset()
 {
+  if (OB_NOT_NULL(reusable_parser_) && OB_NOT_NULL(parser_desc_)) {
+    ObFTParserParam param;
+    param.allocator_ = allocator_;
+    param.metadata_allocator_ = &parser_allocator_;
+    ObITokenIterator *iter = reusable_parser_;
+    parser_desc_->free_token_iter(&param, iter);
+    reusable_parser_ = nullptr;
+  }
+  parser_allocator_.reset();
   parser_desc_ = nullptr;
   allocator_ = nullptr;
   add_word_flag_.clear();

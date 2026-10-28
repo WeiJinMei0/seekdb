@@ -39,8 +39,7 @@ int ObIIKProcessor::process(TokenizeContext &ctx)
   const char *ch = nullptr;
   uint8_t char_len = 0;
 
-  if (OB_FAIL(ctx.current_char_type(type))) {
-  } else if (OB_FAIL(ctx.current_char(ch, char_len))) {
+  if (OB_FAIL(ctx.current_char_and_type(ch, char_len, type))) {
   } else if (OB_FAIL(do_process(ctx, ch, char_len, type))) {
   }
   return ret;
@@ -52,9 +51,26 @@ TokenizeContext::TokenizeContext(ObCollationType coll_type,
                                  int64_t fulltext_len,
                                  bool is_smart)
     : coll_type_(coll_type), fulltext_(fulltext), fulltext_len_(fulltext_len), cursor_(0),
-      next_char_len_(0), handle_size_(0), is_smart_(is_smart), token_list_(allocator),
+      next_char_len_(0), handle_size_(0), is_smart_(is_smart),
+      cs_type_(ObCharset::charset_type_by_coll(coll_type)), token_list_(allocator),
       result_list_(allocator)
 {
+}
+
+int TokenizeContext::reuse_context(const char *fulltext, const int64_t fulltext_len)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(fulltext) || fulltext_len <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    fulltext_ = fulltext;
+    fulltext_len_ = fulltext_len;
+    cursor_ = 0;
+    next_char_len_ = 0;
+    handle_size_ = 0;
+    ret = prepare_next_char();
+  }
+  return ret;
 }
 
 int TokenizeContext::init()
@@ -99,6 +115,21 @@ int TokenizeContext::current_char_type(ObFTCharUtil::CharType &type)
   return ret;
 }
 
+int TokenizeContext::current_char_and_type(const char *&ch,
+                                           uint8_t &char_len,
+                                           ObFTCharUtil::CharType &type)
+{
+  int ret = OB_SUCCESS;
+  if (cursor_ >= fulltext_len_) {
+    ret = OB_ITER_END;
+  } else {
+    ch = fulltext_ + cursor_;
+    char_len = static_cast<uint8_t>(next_char_len_);
+    type = next_char_type_;
+  }
+  return ret;
+}
+
 int TokenizeContext::prepare_next_char()
 {
   int ret = OB_SUCCESS;
@@ -106,7 +137,7 @@ int TokenizeContext::prepare_next_char()
                                           fulltext_ + cursor_,
                                           fulltext_len_ - cursor_,
                                           next_char_len_))) {
-  } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
+  } else if (OB_FAIL(ObFTCharUtil::classify_first_char(cs_type_,
                                                        fulltext_ + cursor_,
                                                        next_char_len_,
                                                        next_char_type_))) {

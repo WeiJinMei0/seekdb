@@ -27,6 +27,71 @@ namespace oceanbase
 namespace storage
 {
 
+namespace
+{
+
+bool check_ascii_stopword(const ObString &word, bool &is_ascii)
+{
+  is_ascii = true;
+  for (int64_t i = 0; is_ascii && i < word.length(); ++i) {
+    is_ascii = static_cast<unsigned char>(word.ptr()[i]) < 0x80;
+  }
+
+  bool is_stopword = false;
+  if (is_ascii) {
+    switch (word.length()) {
+      case 1:
+        is_stopword = 0 == word.case_compare("a") || 0 == word.case_compare("i");
+        break;
+      case 2:
+        is_stopword = 0 == word.case_compare("an") || 0 == word.case_compare("as")
+                   || 0 == word.case_compare("at") || 0 == word.case_compare("be")
+                   || 0 == word.case_compare("by") || 0 == word.case_compare("de")
+                   || 0 == word.case_compare("en") || 0 == word.case_compare("in")
+                   || 0 == word.case_compare("is") || 0 == word.case_compare("it")
+                   || 0 == word.case_compare("la") || 0 == word.case_compare("of")
+                   || 0 == word.case_compare("on") || 0 == word.case_compare("or")
+                   || 0 == word.case_compare("to");
+        break;
+      case 3:
+        is_stopword = 0 == word.case_compare("are") || 0 == word.case_compare("com")
+                   || 0 == word.case_compare("for") || 0 == word.case_compare("how")
+                   || 0 == word.case_compare("the") || 0 == word.case_compare("und")
+                   || 0 == word.case_compare("was") || 0 == word.case_compare("who")
+                   || 0 == word.case_compare("www");
+        break;
+      case 4:
+        is_stopword = 0 == word.case_compare("from") || 0 == word.case_compare("that")
+                   || 0 == word.case_compare("this") || 0 == word.case_compare("what")
+                   || 0 == word.case_compare("when") || 0 == word.case_compare("will")
+                   || 0 == word.case_compare("with");
+        break;
+      case 5:
+        is_stopword = 0 == word.case_compare("about") || 0 == word.case_compare("where");
+        break;
+      default:
+        break;
+    }
+  }
+  return is_stopword;
+}
+
+class UpdateWordCount
+{
+public:
+  explicit UpdateWordCount(const int64_t increment) : increment_(increment) {}
+  int operator()(common::hash::HashMapPair<ObFTWord, int64_t> &pair)
+  {
+    pair.second += increment_;
+    return OB_SUCCESS;
+  }
+
+private:
+  int64_t increment_;
+};
+
+} // namespace
+
 ////////////////////////////////////////////////////////////////////////////////
 // class ObStopWordChecker
 ObStopWordChecker::~ObStopWordChecker()
@@ -74,34 +139,38 @@ void ObStopWordChecker::destroy()
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-  
-  
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+  is_stopword = false;
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    common::ObString cmp_str;
-    // do nothing set out with in if type is the same.
-    if (OB_FAIL(common::ObCharset::charset_convert(
-                                       allocator,
-                                       word.get_word().get_string(),
-                                       word.get_collation_type(),
-                                       stopword_type_.get_collation_type(),
-                                       cmp_str))) {
+    const ObString src_str = word.get_word().get_string();
+    bool is_ascii = false;
+    if (check_ascii_stopword(src_str, is_ascii)) {
+      is_stopword = true;
+    } else if (is_ascii) {
+      // The built-in stopword list contains only ASCII words.
     } else {
-      ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
-      ret = stopword_set_.exist_refactored(converted);
-      if (OB_HASH_NOT_EXIST == ret) {
-        is_stopword = false;
-        ret = OB_SUCCESS;
-      } else if (OB_HASH_EXIST == ret) {
-        is_stopword = true;
-        ret = OB_SUCCESS;
-      } else if (OB_SUCC(ret)) {
-        ret = OB_ERR_UNEXPECTED;
+      common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+      common::ObString cmp_str;
+      if (OB_FAIL(common::ObCharset::charset_convert(
+                                         allocator,
+                                         src_str,
+                                         word.get_collation_type(),
+                                         stopword_type_.get_collation_type(),
+                                         cmp_str))) {
       } else {
+        ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
+        ret = stopword_set_.exist_refactored(converted);
+        if (OB_HASH_NOT_EXIST == ret) {
+          ret = OB_SUCCESS;
+        } else if (OB_HASH_EXIST == ret) {
+          is_stopword = true;
+          ret = OB_SUCCESS;
+        } else if (OB_SUCC(ret)) {
+          ret = OB_ERR_UNEXPECTED;
+        }
       }
     }
   }
@@ -164,15 +233,27 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
-    ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
-                    word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
-                    dst_str,
-                    allocator_))) {
+    const ObString src_str = src.get_word().get_string();
+    bool is_ascii = true;
+    bool has_uppercase = false;
+    for (int64_t i = 0; is_ascii && i < src_str.length(); ++i) {
+      const unsigned char ch = static_cast<unsigned char>(src_str.ptr()[i]);
+      is_ascii = ch < 0x80;
+      has_uppercase = has_uppercase || (ch >= 'A' && ch <= 'Z');
+    }
+    if (is_ascii && !has_uppercase) {
+      dst = src;
     } else {
-      ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
-      dst = tmp;
+      ObString dst_str;
+      if (OB_FAIL(ObCharset::tolower(
+                      word_meta_.get_collation_type(),
+                      src_str,
+                      dst_str,
+                      allocator_))) {
+      } else {
+        ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+        dst = tmp;
+      }
     }
   } else {
     dst = src;
@@ -198,20 +279,14 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
 int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
 {
   int ret = OB_SUCCESS;
-  int64_t word_count = 0;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+    UpdateWordCount update_word_count(word_freq);
+    if (OB_FAIL(word_map_.set_or_update(word, 1/*first occurrence*/, update_word_count))) {
     }
   }
   return ret;

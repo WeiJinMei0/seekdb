@@ -18,10 +18,14 @@
 #define _OCEANBASE_STORAGE_FTS_OB_IK_FT_PARSER_H_
 
 #include "lib/allocator/ob_allocator.h"
+#include "lib/allocator/page_arena.h"
+#include "lib/container/ob_se_array.h"
 #include "storage/fts/dict/ob_ft_cache_container.h"
 #include "storage/fts/dict/ob_ft_dict.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 #include "storage/fts/ik/ob_ik_processor.h"
+#include "storage/fts/ik/ob_ik_arbitrator.h"
+#include "storage/fts/reusable_ft_parser.h"
 #include "data_plane/fts/ob_fts_parser.h"
 
 #include <cstdint>
@@ -31,28 +35,31 @@ namespace storage
 {
 class ObFTDictHub;
 
-class ObIKFTParser final : public ObITokenIterator
+class ObIKFTParser final : public ReusableFTParser
 {
 public:
   ObIKFTParser(ObIAllocator &allocator, ObFTDictHub *hub)
       : allocator_(allocator),
+        scratch_allocator_(lib::ObMemAttr("IKParserData")),
         is_inited_(false),
         coll_type_(ObCollationType::CS_TYPE_INVALID),
         ctx_(nullptr),
         hub_(hub),
-        segmenters_(allocator_),
+        segmenters_(),
         cache_main_(allocator),
         cache_quan_(allocator),
         cache_stop_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
-        dict_stop_(nullptr)
+        dict_stop_(nullptr),
+        arbitrator_()
   {
   }
 
   virtual ~ObIKFTParser() { reset(); }
 
   int init(const ObFTParserParam &param);
+  int reuse_parser(const ObFTParserParam &param) override;
 
   int get_next_token(const char *&word,
                      int64_t &word_len,
@@ -91,12 +98,13 @@ private:
 private:
   static constexpr int SEGMENT_LIMIT = 1000;
   ObIAllocator &allocator_;
+  ObArenaAllocator scratch_allocator_;
   bool is_inited_;
 
   ObCollationType coll_type_;
   TokenizeContext *ctx_;
   ObFTDictHub *hub_;
-  ObList<ObIIKProcessor *, ObIAllocator> segmenters_;
+  ObSEArray<ObIIKProcessor *, 4> segmenters_;
 
   // For now there's no change of dict in one query, so we can pin dict this level.
   ObFTCacheRangeContainer cache_main_;
@@ -106,6 +114,7 @@ private:
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
   ObIFTDict *dict_stop_;
+  ObIKArbitrator arbitrator_;
 
   DISABLE_COPY_ASSIGN(ObIKFTParser);
 };

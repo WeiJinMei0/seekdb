@@ -18,6 +18,7 @@
 #define OB_FTS_PARSER_HELPER_H_
 
 #include "lib/allocator/ob_fifo_allocator.h"
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/string/ob_string.h"
 #include "object/ob_object.h"
@@ -39,6 +40,7 @@ namespace storage
 class ObStopWordChecker;
 class ObFTDictHub;
 class ObAddWord;
+class ReusableFTParser;
 
 #define FTS_BUILD_IN_PARSER_LIST                                                                   \
   FT_PARSER_TYPE(FTP_SPACE, space)                                                                 \
@@ -203,11 +205,12 @@ public:
       common::ObIJsonBase *&json_root);
 
   void reset();
+  void set_allocator(common::ObIAllocator *allocator) { allocator_ = allocator; }
 
   TO_STRING_KV(KP_(allocator), K_(parser_name), KP_(parser_desc), K_(is_inited));
 
 private:
-  static int segment(
+  int segment(
       const ObFTParserProperty &property,
       const int64_t parser_version,
       const ObIFTParserDesc *parser_desc,
@@ -215,7 +218,7 @@ private:
       const char *fulltext,
       const int64_t fulltext_len,
       common::ObIAllocator &allocator,
-      ObAddWord &add_word);
+      ObAddWord &add_word) const;
   int set_add_word_flag(const ObIFTParserDesc &ftparser_desc);
 private:
   common::ObIAllocator *allocator_;
@@ -223,6 +226,8 @@ private:
   ObFTParser parser_name_;
   ObAddWordFlag add_word_flag_;
   ObFTParserProperty parser_property_;
+  mutable common::ObArenaAllocator parser_allocator_;
+  mutable ReusableFTParser *reusable_parser_;
   bool is_inited_;
 
 private:

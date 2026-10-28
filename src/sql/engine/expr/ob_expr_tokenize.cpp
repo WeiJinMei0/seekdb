@@ -27,6 +27,7 @@
 #include "lib/utility/ob_macro_utils.h"
 #include "object/ob_object.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "share/ob_json_access_utils.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
@@ -39,6 +40,104 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+
+struct TokenizeExecutionCache
+{
+  static constexpr int64_t MAX_CACHE_INPUT_SIZE = 64 * 1024;
+  static constexpr int64_t MAX_CACHE_RESULT_SIZE = 1024 * 1024;
+
+  TokenizeExecutionCache()
+    : helper_(), token_map_(), result_allocator_(ObMemAttr("TokResultCache")),
+      cached_fulltext_(), cached_parser_name_(), cached_result_(),
+      collation_(CS_TYPE_INVALID), session_id_(OB_INVALID_ID),
+      map_bucket_count_(0), map_created_(false), result_valid_(false)
+  {}
+  ~TokenizeExecutionCache()
+  {
+    helper_.reset();
+    if (map_created_) {
+      token_map_.destroy();
+    }
+  }
+
+  bool is_result_cacheable(const ObString &fulltext, const ObString &result = ObString()) const
+  {
+    return fulltext.length() <= MAX_CACHE_INPUT_SIZE
+        && result.length() <= MAX_CACHE_RESULT_SIZE;
+  }
+
+  bool has_result(const ObString &fulltext,
+                  const ObString &parser_name,
+                  const ObCollationType collation,
+                  const uint64_t session_id) const
+  {
+    return result_valid_
+        && session_id_ == session_id
+        && collation_ == collation
+        && 0 == cached_fulltext_.compare(fulltext)
+        && 0 == cached_parser_name_.compare(parser_name);
+  }
+
+  int save_result(const ObString &fulltext,
+                  const ObString &parser_name,
+                  const ObCollationType collation,
+                  const uint64_t session_id,
+                  const ObString &result)
+  {
+    int ret = OB_SUCCESS;
+    result_valid_ = false;
+    result_allocator_.reset();
+    if (!is_result_cacheable(fulltext, result)) {
+      // Keep the cache bounded for arbitrary user input.
+    } else if (OB_FAIL(ob_write_string(result_allocator_, fulltext, cached_fulltext_))) {
+    } else if (OB_FAIL(ob_write_string(result_allocator_, parser_name, cached_parser_name_))) {
+    } else if (OB_FAIL(ob_write_string(result_allocator_, result, cached_result_))) {
+    } else {
+      collation_ = collation;
+      session_id_ = session_id;
+      result_valid_ = true;
+    }
+    return ret;
+  }
+
+  int load_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &datum) const
+  {
+    int ret = OB_SUCCESS;
+    char *buf = nullptr;
+    if (OB_UNLIKELY(!result_valid_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(buf = expr.get_str_res_mem(ctx, cached_result_.length()))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(buf, cached_result_.ptr(), cached_result_.length());
+      datum.set_string(buf, cached_result_.length());
+    }
+    return ret;
+  }
+
+  storage::ObFTParseHelper helper_;
+  storage::ObFTWordMap token_map_;
+  common::ObArenaAllocator result_allocator_;
+  ObString cached_fulltext_;
+  ObString cached_parser_name_;
+  ObString cached_result_;
+  ObCollationType collation_;
+  uint64_t session_id_;
+  int64_t map_bucket_count_;
+  bool map_created_;
+  bool result_valid_;
+};
+
+TokenizeExecutionCache &get_tokenize_execution_cache()
+{
+  static thread_local TokenizeExecutionCache cache;
+  return cache;
+}
+
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -53,23 +152,65 @@ ObExprTokenize::~ObExprTokenize() {}
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
   int ret = OB_SUCCESS;
-
-  ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
-
-  ObIJsonBase *json_result = nullptr;
-  TokenizeParam param;
+  TokenizeExecutionCache &cache = get_tokenize_execution_cache();
+  const ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
+  const uint64_t session_id = OB_NOT_NULL(session) ? session->get_sid() : OB_INVALID_ID;
+  ObCollationType collation = CS_TYPE_INVALID;
+  ObString cache_fulltext;
+  ObString cache_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
+  bool result_cacheable = false;
+  bool cache_hit = false;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else if (expr.arg_cnt_ < 3) {
+    collation = expr.args_[0]->obj_meta_.get_collation_type();
+    ObDatum *fulltext_datum = nullptr;
+    ObDatum *parser_datum = nullptr;
+    if (OB_FAIL(expr.args_[0]->eval(ctx, fulltext_datum))) {
+    } else if (OB_NOT_NULL(fulltext_datum) && !fulltext_datum->is_null()) {
+      cache_fulltext = fulltext_datum->get_string();
+    }
+    if (OB_FAIL(ret) || expr.arg_cnt_ < 2) {
+    } else if (OB_FAIL(expr.args_[1]->eval(ctx, parser_datum))) {
+    } else if (OB_NOT_NULL(parser_datum) && !parser_datum->is_null()) {
+      cache_parser_name = parser_datum->get_string().trim();
+    }
+    if (OB_SUCC(ret)) {
+      result_cacheable = 0 == cache_parser_name.case_compare("ik")
+          || 0 == cache_parser_name.case_compare("beng");
+      cache_hit = result_cacheable
+          && cache.is_result_cacheable(cache_fulltext)
+          && cache.has_result(cache_fulltext, cache_parser_name, collation, session_id);
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (cache_hit) {
+    ret = cache.load_result(expr, ctx, expr_datum);
+  } else {
+    ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
+    common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
+    ObIJsonBase *json_result = nullptr;
+    TokenizeParam param;
+    if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
+    } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+    } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+                                                       ctx,
+                                                       temp_allocator,
+                                                       json_result,
+                                                       expr_datum))) {
+    } else if (result_cacheable && !expr_datum.is_null()) {
+      const int cache_ret = cache.save_result(cache_fulltext,
+                                              cache_parser_name,
+                                              collation,
+                                              session_id,
+                                              expr_datum.get_string());
+      if (OB_UNLIKELY(OB_SUCCESS != cache_ret)) {
+        LOG_WARN("failed to save tokenize result cache", K(cache_ret));
+      }
+    }
   }
 
   return ret;
@@ -81,36 +222,72 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
                                       ObIJsonBase *&result)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParseHelper tokenize_helper;
   const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
-  storage::ObFTWordMap token_map;
-
-  ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
+  storage::ObFTParseHelper local_helper;
+  storage::ObFTWordMap local_token_map;
+  storage::ObFTParseHelper *tokenize_helper = &local_helper;
+  storage::ObFTWordMap *token_map = &local_token_map;
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
-  } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
-  } else if (
+  } else if (param.cacheable_) {
+    TokenizeExecutionCache &cache = get_tokenize_execution_cache();
+    bool is_same = false;
+    if (OB_FAIL(cache.helper_.check_is_the_same(param.parser_name_, param.properties_, is_same))) {
+    } else if (FALSE_IT(is_same = is_same
+                                  && cache.map_created_
+                                  && cache.map_bucket_count_ == ft_word_bkt_cnt
+                                  && cache.collation_ == param.meta_.get_collation_type())) {
+    } else if (!is_same) {
+      cache.helper_.reset();
+      if (cache.map_created_) {
+        cache.token_map_.destroy();
+        cache.map_created_ = false;
+      }
+      cache.map_bucket_count_ = 0;
+      cache.collation_ = CS_TYPE_INVALID;
+      if (OB_FAIL(cache.helper_.init(&allocator, param.parser_name_, param.properties_))) {
+      } else if (OB_FAIL(cache.token_map_.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+        cache.helper_.reset();
+      } else {
+        cache.map_bucket_count_ = ft_word_bkt_cnt;
+        cache.map_created_ = true;
+        cache.collation_ = param.meta_.get_collation_type();
+      }
+    }
+    if (OB_SUCC(ret)) {
+      cache.helper_.set_allocator(&allocator);
+      tokenize_helper = &cache.helper_;
+      token_map = &cache.token_map_;
+    }
+  } else if (OB_FAIL(local_helper.init(&allocator, param.parser_name_, param.properties_))) {
+  } else if (OB_FAIL(local_token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+  }
+
+  if (OB_SUCC(ret)) {
+    token_map->reuse();
+  }
+  if (OB_SUCC(ret) &&
       (0 != param.fulltext_.length())
-      && OB_FAIL(tokenize_helper.segment(
+      && OB_FAIL(tokenize_helper->segment(
                      param.meta_,
                      param.fulltext_.ptr(),
                      param.fulltext_.length(),
                      doc_len,
-                     token_map))) {
-  } else {
+                     *token_map))) {
+  }
+  if (OB_SUCC(ret)) {
     switch (param.output_mode_) {
     case TokenizeParam::OUTPUT_MODE::DEFAULT: {
-      if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, result))) {
+      if (OB_FAIL(tokenize_helper->make_token_array_json(*token_map, result))) {
       } else {
         // pass
       }
       break;
     }
     case TokenizeParam::OUTPUT_MODE::ALL: {
-      if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
+      if (OB_FAIL(tokenize_helper->make_detail_json(*token_map, doc_len, result))) {
       } else {
         // pass
       }
@@ -128,6 +305,7 @@ ObExprTokenize::TokenizeParam ::TokenizeParam()
     parser_name_(ObString(OB_DEFAULT_FULLTEXT_PARSER_NAME)),
     meta_(),
     fulltext_(),
+    cacheable_(false),
     output_mode_(OUTPUT_MODE::DEFAULT)
 {
 }
@@ -214,6 +392,8 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
   } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
   } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+  } else {
+    param.cacheable_ = expr.arg_cnt_ < 3;
   }
   return ret;
 }

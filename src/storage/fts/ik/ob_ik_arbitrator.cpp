@@ -39,8 +39,7 @@ int ObIKArbitrator::process(TokenizeContext &ctx)
   ObList<ObIKToken, ObIAllocator> &tokens = ctx.token_list().tokens();
   ObIKTokenChain *chain_need_arbitrate = nullptr;
   bool use_smart = ctx.is_smart();
-  if (OB_FAIL(prepare(ctx))) {
-  } else if (OB_ISNULL(chain_need_arbitrate = OB_NEWx(ObIKTokenChain, &alloc_, alloc_))) {
+  if (OB_ISNULL(chain_need_arbitrate = OB_NEWx(ObIKTokenChain, &alloc_, alloc_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("alloc memory failed");
   } else {
@@ -298,15 +297,21 @@ int ObIKArbitrator::remove_conflict(const ObIKToken &token, ObIKTokenChain *opti
   return ret;
 }
 
-int ObIKArbitrator::prepare(TokenizeContext &ctx)
+int ObIKArbitrator::prepare(const int64_t fulltext_len)
 {
   int ret = OB_SUCCESS;
 
-  int cal_bucket_num = MAX(ctx.fulltext_len() / 100, 10);
+  int cal_bucket_num = MAX(fulltext_len / 100, 10);
   cal_bucket_num = MIN(cal_bucket_num, 100);
   if (OB_FAIL(chains_.create(cal_bucket_num, ObMemAttr("IK ARBITRATE")))) {
   }
   return ret;
+}
+
+void ObIKArbitrator::reuse()
+{
+  chains_.reuse();
+  alloc_.reset_remain_one_page();
 }
 
 ObIKArbitrator::ObIKArbitrator() : alloc_(lib::ObMemAttr("IK Arbitrator")) {}

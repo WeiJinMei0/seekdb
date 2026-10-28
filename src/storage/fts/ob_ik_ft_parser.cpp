@@ -55,6 +55,7 @@ int ObIKFTParser::init(const ObFTParserParam &param)
     } else if (OB_FAIL(init_dict(param))) {
     } else if (OB_FAIL(init_ctx(param))) {
     } else if (OB_FAIL(init_segmenter(param))) {
+    } else if (OB_FAIL(arbitrator_.prepare(param.ft_length_))) {
     }
 
     if (OB_FAIL(ret)) {
@@ -64,6 +65,27 @@ int ObIKFTParser::init(const ObFTParserParam &param)
     }
   }
 
+  return ret;
+}
+
+int ObIKFTParser::reuse_parser(const ObFTParserParam &param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(!param.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (coll_type_ != ObCharset::collation_type(param.cs_->name)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(ctx_->reset_resource())) {
+  } else {
+    arbitrator_.reuse();
+    for (ObIIKProcessor *segmenter : segmenters_) {
+      segmenter->reuse();
+    }
+    scratch_allocator_.reset_remain_one_page();
+    ret = ctx_->reuse_context(param.fulltext_, param.ft_length_);
+  }
   return ret;
 }
 
@@ -135,10 +157,10 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
 {
   int ret = OB_SUCCESS;
   // proces by char with all segmenters
-  for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
+  for (ObSEArray<ObIIKProcessor *, 4>::iterator iter = segmenters_.begin();
        OB_SUCC(ret) && iter != segmenters_.end();
        iter++) {
-    if (OB_FAIL((*iter)->process(ctx))) {
+    if (OB_FAIL((*iter)->do_process(ctx, ch, char_len, type))) {
     }
   }
   return ret;
@@ -148,6 +170,7 @@ int ObIKFTParser::process_next_batch()
 {
   int ret = OB_SUCCESS;
   ctx_->reset_resource();
+  arbitrator_.reuse();
 
   // handle next segmenter
   bool do_seg = false;
@@ -178,9 +201,8 @@ int ObIKFTParser::process_next_batch()
     }
 
     if (OB_SUCC(ret) || OB_ITER_END == ret) {
-      ObIKArbitrator arb;
-      if (OB_FAIL(arb.process(*ctx_))) {
-      } else if (OB_FAIL(arb.output_result(*ctx_))) {
+      if (OB_FAIL(arbitrator_.process(*ctx_))) {
+      } else if (OB_FAIL(arbitrator_.output_result(*ctx_))) {
       }
     } else {
       // Already logged.
@@ -195,18 +217,22 @@ int ObIKFTParserDesc::segment(ObFTParserParam *param, ObITokenIterator *&iter) c
   int ret = OB_SUCCESS;
   ObIKFTParser *parser = nullptr;
   ObFTDictHub *hub = nullptr;
+  ObIAllocator *metadata_allocator = OB_NOT_NULL(param) && OB_NOT_NULL(param->metadata_allocator_)
+                                      ? param->metadata_allocator_ : (OB_NOT_NULL(param) ? param->allocator_ : nullptr);
   if (OB_ISNULL(param) || OB_UNLIKELY(!param->is_valid())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(ObFTParseData::instance().get_dict_hub(hub))) {
-  } else if (OB_ISNULL(parser = OB_NEWx(ObIKFTParser, param->allocator_, *(param->allocator_), hub))) {
+  } else if (OB_ISNULL(metadata_allocator)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_ISNULL(parser = OB_NEWx(ObIKFTParser, metadata_allocator, *metadata_allocator, hub))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_FAIL(parser->init(*param))) {
   } else {
     iter = parser;
   }
 
-  if (OB_FAIL(ret)) {
-    OB_DELETEx(ObIKFTParser, param->allocator_, parser);
+  if (OB_FAIL(ret) && OB_NOT_NULL(metadata_allocator)) {
+    OB_DELETEx(ObIKFTParser, metadata_allocator, parser);
   }
 
   return ret;
@@ -215,8 +241,15 @@ int ObIKFTParserDesc::segment(ObFTParserParam *param, ObITokenIterator *&iter) c
 void ObIKFTParserDesc::free_token_iter(ObFTParserParam *param,
                                        ObITokenIterator *&iter) const
 {
-  iter->~ObITokenIterator();
-  param->allocator_->free(iter);
+  if (OB_NOT_NULL(iter) && OB_NOT_NULL(param)) {
+    ObIAllocator *metadata_allocator = OB_NOT_NULL(param->metadata_allocator_)
+                                        ? param->metadata_allocator_ : param->allocator_;
+    if (OB_NOT_NULL(metadata_allocator)) {
+      iter->~ObITokenIterator();
+      metadata_allocator->free(iter);
+      iter = nullptr;
+    }
+  }
 }
 
 
@@ -294,7 +327,7 @@ int ObIKFTParser::init_ctx(const ObFTParserParam &param)
   } else if (OB_ISNULL(ctx_ = OB_NEWx(TokenizeContext,
                                       &allocator_,
                                       coll_type_,
-                                      allocator_,
+                                      scratch_allocator_,
                                       param.fulltext_,
                                       param.ft_length_,
                                       param.ik_param_.mode_ == ObFTIKParam::Mode::SMART))) {
@@ -319,11 +352,11 @@ int ObIKFTParser::init_segmenter(const ObFTParserParam &param)
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_ISNULL(dict_quan_)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(cnqsg = OB_NEWx(ObIKQuantifierProcessor, &allocator_, *dict_quan_, allocator_))) {
+  } else if (OB_ISNULL(cnqsg = OB_NEWx(ObIKQuantifierProcessor, &allocator_, *dict_quan_, scratch_allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_ISNULL(dict_main_)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(cjksg = OB_NEWx(ObIKCJKProcessor, &allocator_, *dict_main_, allocator_))) {
+  } else if (OB_ISNULL(cjksg = OB_NEWx(ObIKCJKProcessor, &allocator_, *dict_main_, scratch_allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_ISNULL(surrogate_seg = OB_NEWx(ObIKSurrogateProcessor, &allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -360,7 +393,7 @@ void ObIKFTParser::reset()
       allocator_.free(segmenter);
     }
   }
-  segmenters_.clear();
+  segmenters_.reset();
 
   cache_main_.reset();
   cache_quan_.reset();
@@ -378,6 +411,8 @@ void ObIKFTParser::reset()
     dict_stop_->~ObIFTDict();
     allocator_.free(dict_stop_);
   }
+
+  scratch_allocator_.reset();
 
   is_inited_ = false;
 }
