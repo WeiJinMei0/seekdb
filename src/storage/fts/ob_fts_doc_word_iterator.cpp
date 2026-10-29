@@ -100,11 +100,6 @@ int ObFTDocWordScanIterator::do_table_rescan()
     ret = OB_ERR_UNDEFINED;
   } else if (OB_FAIL(::oceanbase::share::server_service<::oceanbase::storage::ObAccessService>()->table_rescan(scan_param_, doc_word_iter_))) {
   }
-#ifdef OB_BUILD_PACKAGE
-  LOG_TRACE("doc word rescan", K(ret), K(scan_param_));
-#else
-  LOG_INFO("doc word rescan", K(ret), K(scan_param_));
-#endif
   return ret;
 }
 
@@ -271,11 +266,6 @@ int ObFTDocWordScanIterator::do_table_scan()
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(::oceanbase::share::server_service<::oceanbase::storage::ObAccessService>()->table_scan(scan_param_, doc_word_iter_))) {
   }
-#ifdef OB_BUILD_PACKAGE
-  LOG_TRACE("doc word scan", K(ret), K(scan_param_));
-#else
-  LOG_INFO("doc word scan", K(ret), K(scan_param_));
-#endif
   return ret;
 }
 
