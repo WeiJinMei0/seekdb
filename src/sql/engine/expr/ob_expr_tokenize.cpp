@@ -27,7 +27,7 @@
 #include "lib/utility/ob_macro_utils.h"
 #include "object/ob_object.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
-#include "sql/session/ob_sql_session_info.h"
+#include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "share/ob_json_access_utils.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
@@ -51,7 +51,7 @@ struct TokenizeExecutionCache
   TokenizeExecutionCache()
     : helper_(), token_map_(), result_allocator_(ObMemAttr("TokResultCache")),
       cached_fulltext_(), cached_parser_name_(), cached_result_(),
-      collation_(CS_TYPE_INVALID), session_id_(OB_INVALID_ID),
+      collation_(CS_TYPE_INVALID),
       map_bucket_count_(0), map_created_(false), result_valid_(false)
   {}
   ~TokenizeExecutionCache()
@@ -70,11 +70,9 @@ struct TokenizeExecutionCache
 
   bool has_result(const ObString &fulltext,
                   const ObString &parser_name,
-                  const ObCollationType collation,
-                  const uint64_t session_id) const
+                  const ObCollationType collation) const
   {
     return result_valid_
-        && session_id_ == session_id
         && collation_ == collation
         && 0 == cached_fulltext_.compare(fulltext)
         && 0 == cached_parser_name_.compare(parser_name);
@@ -83,7 +81,6 @@ struct TokenizeExecutionCache
   int save_result(const ObString &fulltext,
                   const ObString &parser_name,
                   const ObCollationType collation,
-                  const uint64_t session_id,
                   const ObString &result)
   {
     int ret = OB_SUCCESS;
@@ -96,7 +93,6 @@ struct TokenizeExecutionCache
     } else if (OB_FAIL(ob_write_string(result_allocator_, result, cached_result_))) {
     } else {
       collation_ = collation;
-      session_id_ = session_id;
       result_valid_ = true;
     }
     return ret;
@@ -124,7 +120,6 @@ struct TokenizeExecutionCache
   ObString cached_parser_name_;
   ObString cached_result_;
   ObCollationType collation_;
-  uint64_t session_id_;
   int64_t map_bucket_count_;
   bool map_created_;
   bool result_valid_;
@@ -153,13 +148,12 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
 {
   int ret = OB_SUCCESS;
   TokenizeExecutionCache &cache = get_tokenize_execution_cache();
-  const ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
-  const uint64_t session_id = OB_NOT_NULL(session) ? session->get_sid() : OB_INVALID_ID;
   ObCollationType collation = CS_TYPE_INVALID;
   ObString cache_fulltext;
   ObString cache_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
   bool result_cacheable = false;
   bool cache_hit = false;
+  bool fulltext_has_lob_header = false;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
@@ -171,6 +165,7 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
     if (OB_FAIL(expr.args_[0]->eval(ctx, fulltext_datum))) {
     } else if (OB_NOT_NULL(fulltext_datum) && !fulltext_datum->is_null()) {
       cache_fulltext = fulltext_datum->get_string();
+      fulltext_has_lob_header = fulltext_datum->has_lob_header();
     }
     if (OB_FAIL(ret) || expr.arg_cnt_ < 2) {
     } else if (OB_FAIL(expr.args_[1]->eval(ctx, parser_datum))) {
@@ -178,11 +173,12 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
       cache_parser_name = parser_datum->get_string().trim();
     }
     if (OB_SUCC(ret)) {
-      result_cacheable = 0 == cache_parser_name.case_compare("ik")
-          || 0 == cache_parser_name.case_compare("beng");
+      result_cacheable = !fulltext_has_lob_header
+          && (0 == cache_parser_name.case_compare("ik")
+              || 0 == cache_parser_name.case_compare("beng"));
       cache_hit = result_cacheable
           && cache.is_result_cacheable(cache_fulltext)
-          && cache.has_result(cache_fulltext, cache_parser_name, collation, session_id);
+          && cache.has_result(cache_fulltext, cache_parser_name, collation);
     }
   }
 
@@ -205,7 +201,6 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
       const int cache_ret = cache.save_result(cache_fulltext,
                                               cache_parser_name,
                                               collation,
-                                              session_id,
                                               expr_datum.get_string());
       if (OB_UNLIKELY(OB_SUCCESS != cache_ret)) {
         LOG_WARN("failed to save tokenize result cache", K(cache_ret));
@@ -484,8 +479,13 @@ int ObExprTokenize::parse_fulltext(const ObExpr &expr, ObEvalCtx &ctx, TokenizeP
     if (fulltext_datum->is_null()) {
       // do nothing, return empty result
       param.fulltext_ = ObString::make_empty_string();
-    } else {
-      param.fulltext_ = fulltext_datum->get_string();
+    } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+                           ctx.exec_ctx_,
+                           param.allocator_,
+                           *fulltext_datum,
+                           expr.args_[0]->datum_meta_,
+                           fulltext_datum->has_lob_header(),
+                           param.fulltext_))) {
     }
     param.meta_.set_varchar(); // as we hardcoded in fts_index
     param.meta_.set_collation_type(expr.args_[0]->obj_meta_.get_collation_type());

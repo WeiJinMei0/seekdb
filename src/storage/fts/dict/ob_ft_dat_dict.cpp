@@ -31,6 +31,10 @@ namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+constexpr uint32_t ARRAY_HASH_PROBE_STEP = 3;
+}
 template <typename DATA_TYPE>
 int ObFTDATBuilder<DATA_TYPE>::init(ObFTTrie<DATA_TYPE> &trie)
 {
@@ -260,7 +264,7 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
 
   ObFTSingleWord word;
   word.set_word(ft_char.ptr(), ft_char.length());
-  if (OB_FAIL(dat_->get_map()->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
+  if (OB_FAIL(map->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
   } else if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
     hit.set_unmatch();
@@ -302,15 +306,18 @@ ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(b
 int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 {
   int ret = OB_ENTRY_NOT_EXIST;
-  uint64_t hash = word.get_word().hash();
-  uint64_t index = hash % header_.capacity_;
+  const uint32_t capacity = header_.capacity_;
+  uint64_t index = word.get_word().hash() % capacity;
   while (header_.data[index].used) {
     if (header_.data[index].word == word) {
       code = header_.data[index].code;
       ret = OB_SUCCESS;
       break;
     } else {
-      index = (index + 3) % header_.capacity_;
+      index += ARRAY_HASH_PROBE_STEP;
+      if (OB_UNLIKELY(index >= capacity)) {
+        index -= capacity;
+      }
     }
   }
   return ret;
@@ -319,10 +326,13 @@ int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
 {
   int ret = OB_SUCCESS;
-  uint64_t hash = key.hash();
-  uint64_t index = hash % header_.capacity_;
+  const uint32_t capacity = header_.capacity_;
+  uint64_t index = key.hash() % capacity;
   while (header_.data[index].used) {
-    index = (index + 3) % header_.capacity_;
+    index += ARRAY_HASH_PROBE_STEP;
+    if (OB_UNLIKELY(index >= capacity)) {
+      index -= capacity;
+    }
   }
 
   header_.data[index].code = code;

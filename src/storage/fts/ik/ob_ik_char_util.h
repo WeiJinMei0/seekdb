@@ -56,6 +56,11 @@ public:
                                  const uint8_t char_len,
                                  CharType &type);
 
+  static int first_valid_char_fast(ObCollationType coll_type,
+                                   const char *buf,
+                                   int64_t buf_size,
+                                   int64_t &char_len);
+
   static int check_cn_number(ObCollationType coll_type,
                              const char *input,
                              const uint8_t char_len,
@@ -78,6 +83,15 @@ public:
                                   bool &ignore);
 
 private:
+  static inline bool is_continuation_byte(const char ch)
+  {
+    return (static_cast<unsigned char>(ch) >> 6) == 0x02;
+  }
+
+  static int classify_utf8mb4_fast(const char *input,
+                                   uint8_t char_len,
+                                   CharType &type);
+
   template <ObCharsetType CS_TYPE>
   static int do_classify(const char *input, const uint8_t char_len, CharType &type);
 
@@ -478,7 +492,40 @@ inline int ObFTCharUtil::classify_first_char(ObCollationType coll_type,
                                              const uint8_t char_len,
                                              CharType &type)
 {
-  return classify_first_char(ObCharset::charset_type_by_coll(coll_type), input, char_len, type);
+  const ObCharsetType cs_type = ObCharset::charset_type_by_coll(coll_type);
+  return CHARSET_UTF8MB4 == cs_type
+      ? classify_utf8mb4_fast(input, char_len, type)
+      : classify_first_char(cs_type, input, char_len, type);
+}
+
+inline int ObFTCharUtil::classify_utf8mb4_fast(const char *input,
+                                                const uint8_t char_len,
+                                                CharType &type)
+{
+  int ret = OB_SUCCESS;
+  type = CharType::USELESS;
+  if (OB_ISNULL(input) || 0 == char_len) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const unsigned char first = static_cast<unsigned char>(input[0]);
+    if (first < 0x80) {
+      if ((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z')) {
+        type = CharType::ENGLISH_LETTER;
+      } else if (first >= '0' && first <= '9') {
+        type = CharType::ARABIC_LETTER;
+      }
+    } else if (first >= 0xE4 && first <= 0xE9 && char_len >= 2) {
+      const unsigned char second = static_cast<unsigned char>(input[1]);
+      if (first > 0xE4 || second >= 0xB8) {
+        type = CharType::CHINESE;
+      } else {
+        ret = do_classify<CHARSET_UTF8MB4>(input, char_len, type);
+      }
+    } else {
+      ret = do_classify<CHARSET_UTF8MB4>(input, char_len, type);
+    }
+  }
+  return ret;
 }
 
 inline int ObFTCharUtil::classify_first_char(ObCharsetType cs_type,
@@ -504,6 +551,53 @@ inline int ObFTCharUtil::classify_first_char(ObCharsetType cs_type,
     ret = OB_NOT_SUPPORTED;
     STORAGE_FTS_LOG(WARN, "Not supported charset type", K(ret), K(cs_type));
     break;
+  }
+  return ret;
+}
+
+inline int ObFTCharUtil::first_valid_char_fast(ObCollationType coll_type,
+                                                const char *buf,
+                                                const int64_t buf_size,
+                                                int64_t &char_len)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(ObCharset::charset_type_by_coll(coll_type) != CHARSET_UTF8MB4)) {
+    ret = ObCharset::first_valid_char(coll_type, buf, buf_size, char_len);
+  } else if (OB_ISNULL(buf)) {
+    ret = OB_NOT_INIT;
+  } else if (buf_size <= 0) {
+    char_len = 0;
+  } else {
+    const unsigned char c = static_cast<unsigned char>(buf[0]);
+    const unsigned char c1 = buf_size > 1 ? static_cast<unsigned char>(buf[1]) : 0;
+    if (c < 0x80) {
+      char_len = 1;
+    } else if (c < 0xc2) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (c < 0xe0) {
+      if (buf_size < 2 || !is_continuation_byte(buf[1])) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        char_len = 2;
+      }
+    } else if (c < 0xf0) {
+      if (buf_size < 3 || !is_continuation_byte(buf[1]) || !is_continuation_byte(buf[2])
+          || (c == 0xe0 && c1 < 0xa0) || (c == 0xed && c1 >= 0xa0)) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        char_len = 3;
+      }
+    } else if (c < 0xf5) {
+      if (buf_size < 4 || !is_continuation_byte(buf[1]) || !is_continuation_byte(buf[2])
+          || !is_continuation_byte(buf[3]) || (c == 0xf0 && c1 < 0x90)
+          || (c == 0xf4 && c1 > 0x8f)) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        char_len = 4;
+      }
+    } else {
+      ret = OB_INVALID_ARGUMENT;
+    }
   }
   return ret;
 }

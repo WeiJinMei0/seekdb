@@ -12251,11 +12251,17 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     }
   }
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
-                                                              get_stmt(),
-                                                              match_against,
-                                                              need_calc_relevance,
-                                                              constraints))) {
+    if (!get_stmt()->is_select_stmt()
+        || NATURAL_LANGUAGE_MODE != match_against->get_mode_flag()
+        || match_against->is_es_match()
+        || match_against->get_columns_boosts().count() > 0) {
+      need_calc_relevance = true;
+    } else if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(
+                           get_optimizer_context().get_exec_ctx(),
+                           get_stmt(),
+                           match_against,
+                           need_calc_relevance,
+                           constraints))) {
     } else if (!need_calc_relevance &&
                OB_FAIL(append_array_no_dup(get_optimizer_context().get_query_ctx()->all_expr_constraints_, constraints))) {
     }

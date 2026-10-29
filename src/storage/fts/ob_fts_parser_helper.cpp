@@ -288,6 +288,17 @@ int ObFTParseHelper::segment(
     if (parser_is_reusable && OB_NOT_NULL(reusable_parser_)) {
       iter = reusable_parser_;
       if (OB_FAIL(reusable_parser_->reuse_parser(param))) {
+        if (OB_INVALID_ARGUMENT == ret) {
+          // Reusable parsers retain collation-specific state.  Rebuild the
+          // parser when one helper is used for a different string collation.
+          parser_desc->free_token_iter(&param, iter);
+          reusable_parser_ = nullptr;
+          parser_allocator_.reset();
+          ret = parser_desc->segment(&param, iter);
+          if (OB_SUCC(ret)) {
+            reusable_parser_ = static_cast<ReusableFTParser *>(iter);
+          }
+        }
       }
     } else if (OB_FAIL(parser_desc->segment(&param, iter))) {
     } else if (OB_ISNULL(iter)) {
@@ -398,7 +409,11 @@ int ObFTParseHelper::segment(
   } else if (OB_ISNULL(cs = common::ObCharset::get_charset(type))) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    words.reuse();
+    // A newly-created map is already empty.  Avoid walking every bucket on
+    // the overwhelmingly common first parse.
+    if (!words.empty()) {
+      words.reuse();
+    }
     ObAddWord add_word(parser_property_, meta, add_word_flag_, *allocator_, words);
     if (OB_FAIL(segment(
                     parser_property_,

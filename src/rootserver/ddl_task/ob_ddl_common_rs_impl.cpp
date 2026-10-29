@@ -37,6 +37,7 @@
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 
 #include "sql/ob_sql_utils.h"
+#include "data_plane/ob_order_perserving_encoder.h"
 #include "sql/engine/px/ob_px_dtl_msg.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
@@ -307,6 +308,33 @@ int ObDDLTaskUtil::generate_order_by_str(
   return ret;
 }
 
+static bool can_encode_fts_build_sortkey(const ObTableSchema &dest_table_schema)
+{
+  bool can_encode = true;
+  const ObRowkeyInfo &rowkey_info = dest_table_schema.get_rowkey_info();
+  for (int64_t i = 0; can_encode && i < rowkey_info.get_size(); ++i) {
+    const ObRowkeyColumn *rowkey_column = rowkey_info.get_column(i);
+    if (OB_ISNULL(rowkey_column)) {
+      can_encode = false;
+    } else {
+      uint64_t col_id = rowkey_column->column_id_;
+      if (common::is_shadow_column(col_id)) {
+        col_id -= OB_MIN_SHADOW_COLUMN_ID;
+      }
+      const ObColumnSchemaV2 *column_schema = dest_table_schema.get_column_schema(col_id);
+      if (OB_ISNULL(column_schema)) {
+        can_encode = false;
+      } else {
+        const ObObjType type = column_schema->get_data_type();
+        const ObCollationType collation_type = column_schema->get_collation_type();
+        can_encode = share::ObOrderPerservingEncoder::can_encode_sortkey(type, collation_type)
+            || share::ObOrderPerservingEncoder::can_encode_varlen_sortkey(type, collation_type);
+      }
+    }
+  }
+  return can_encode;
+}
+
 int ObDDLTaskUtil::generate_build_replica_sql(const int64_t data_table_id,
     const int64_t dest_table_id,
     const int64_t schema_version,
@@ -534,8 +562,13 @@ int ObDDLTaskUtil::generate_build_replica_sql(const int64_t data_table_id,
         }
         if (OB_FAIL(ret)) {
         } else {
-          if (OB_FAIL(sql_string.assign_fmt("INSERT /*+ enable_parallel_dml parallel(%ld) opt_param('ddl_execution_id', %ld) opt_param('ddl_task_id', %ld) opt_param('enable_newsort', 'false') %.*s use_px */INTO `%.*s`.`%.*s` %.*s(%.*s) SELECT /*+ index(`%.*s` primary) %.*s */ %.*s from `%.*s`.`%.*s` %.*s as of snapshot %ld %.*s",
+          const bool use_encoded_sortkey =
+              (dest_table_schema->is_fts_index_aux() || dest_table_schema->is_fts_doc_word_aux())
+              && can_encode_fts_build_sortkey(*dest_table_schema);
+          const char *newsort_value = use_encoded_sortkey ? "true" : "false";
+          if (OB_FAIL(sql_string.assign_fmt("INSERT /*+ enable_parallel_dml parallel(%ld) opt_param('ddl_execution_id', %ld) opt_param('ddl_task_id', %ld) opt_param('enable_newsort', '%.*s') %.*s use_px */INTO `%.*s`.`%.*s` %.*s(%.*s) SELECT /*+ index(`%.*s` primary) %.*s */ %.*s from `%.*s`.`%.*s` %.*s as of snapshot %ld %.*s",
               real_parallelism, execution_id, task_id,
+              static_cast<int>(strlen(newsort_value)), newsort_value,
               static_cast<int>(strlen(io_read_hint)), io_read_hint,
               static_cast<int>(new_dest_database_name.length()), new_dest_database_name.ptr(), static_cast<int>(new_dest_table_name.length()), new_dest_table_name.ptr(),
               static_cast<int>(partition_names.length()), partition_names.ptr(),

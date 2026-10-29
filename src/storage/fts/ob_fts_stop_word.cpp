@@ -147,10 +147,23 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
   } else {
     const ObString src_str = word.get_word().get_string();
     bool is_ascii = false;
-    if (check_ascii_stopword(src_str, is_ascii)) {
+    const bool is_utf8mb4 = ObCharset::charset_type_by_coll(word.get_collation_type())
+                            == ObCharsetType::CHARSET_UTF8MB4;
+    if (is_utf8mb4 && check_ascii_stopword(src_str, is_ascii)) {
       is_stopword = true;
-    } else if (is_ascii) {
+    } else if (is_utf8mb4 && is_ascii) {
       // The built-in stopword list contains only ASCII words.
+    } else if (word.get_collation_type() == stopword_type_.get_collation_type()) {
+      ObFTWord converted(src_str.length(), src_str.ptr(), stopword_type_);
+      ret = stopword_set_.exist_refactored(converted);
+      if (OB_HASH_NOT_EXIST == ret) {
+        ret = OB_SUCCESS;
+      } else if (OB_HASH_EXIST == ret) {
+        is_stopword = true;
+        ret = OB_SUCCESS;
+      } else if (OB_SUCC(ret)) {
+        ret = OB_ERR_UNEXPECTED;
+      }
     } else {
       common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
       common::ObString cmp_str;
@@ -232,17 +245,33 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (flag_.casedown()) {
+  } else if (!flag_.casedown()) {
+    dst = src;
+  } else {
     const ObString src_str = src.get_word().get_string();
-    bool is_ascii = true;
-    bool has_uppercase = false;
-    for (int64_t i = 0; is_ascii && i < src_str.length(); ++i) {
-      const unsigned char ch = static_cast<unsigned char>(src_str.ptr()[i]);
-      is_ascii = ch < 0x80;
-      has_uppercase = has_uppercase || (ch >= 'A' && ch <= 'Z');
-    }
-    if (is_ascii && !has_uppercase) {
-      dst = src;
+    const ObCharsetInfo *cs_info = ObCharset::get_charset(word_meta_.get_collation_type());
+    constexpr int64_t STACK_CASE_BUF_SIZE = 256;
+    char stack_buf[STACK_CASE_BUF_SIZE];
+    if (OB_ISNULL(cs_info) || OB_ISNULL(cs_info->cset) || cs_info->casedn_multiply <= 0) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (src_str.length() * cs_info->casedn_multiply <= STACK_CASE_BUF_SIZE) {
+      const size_t dst_len = cs_info->cset->casedn(cs_info,
+                                                   const_cast<char *>(src_str.ptr()),
+                                                   src_str.length(),
+                                                   stack_buf,
+                                                   STACK_CASE_BUF_SIZE);
+      if (dst_len == static_cast<size_t>(src_str.length())
+          && 0 == MEMCMP(stack_buf, src_str.ptr(), dst_len)) {
+        dst = src;
+      } else {
+        ObString dst_str;
+        if (OB_FAIL(ob_write_string(allocator_,
+                                    ObString(static_cast<int32_t>(dst_len), stack_buf),
+                                    dst_str))) {
+        } else {
+          dst = ObFTWord(dst_str.length(), dst_str.ptr(), word_meta_);
+        }
+      }
     } else {
       ObString dst_str;
       if (OB_FAIL(ObCharset::tolower(
@@ -255,8 +284,6 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
         dst = tmp;
       }
     }
-  } else {
-    dst = src;
   }
   return ret;
 }
